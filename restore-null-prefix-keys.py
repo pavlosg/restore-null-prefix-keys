@@ -1,4 +1,5 @@
 import json
+import sys
 import zlib
 from datetime import timedelta
 
@@ -69,7 +70,7 @@ def get_doc(id):
         client.vbucketId = vbid
         flags, cas, doc = client.get(id)
         return doc, cas, flags, vbid
-    except mc_bin_client.ErrorNotMyVbucket:
+    except mc_bin_client.ErrorKeyEnoent:
         pass
     vbid = get_vbid(id[1:])
     client = vb_map[vbid]
@@ -77,8 +78,9 @@ def get_doc(id):
     flags, cas, doc = client.get(id)
     return doc, cas, flags, vbid
 
-def add_doc(id, value, flags):
-    vbid = get_vbid(id)
+def add_doc(id, value, flags, vbid=None):
+    if vbid is None:
+        vbid = get_vbid(id)
     client: mc_bin_client.MemcachedClient = vb_map[vbid]
     client.vbucketId = vbid
     client.add_with_dtype(id, 0, flags, value, 1)
@@ -114,6 +116,12 @@ def main():
     print(f'Found {len(doc_ids)} null-prefixed doc ids\n')
     connect_cluster()
     print()
+    if len(sys.argv) == 3 and sys.argv[1] == 'test-add-doc':
+        id = '\0' + sys.argv[2]
+        add_doc(id, '{}', 0, get_vbid(sys.argv[2]))
+        print('Added test doc', json.dumps(id))
+        disconnect()
+        return
     not_found_count = 0
     already_exist_count = 0
     added_count = 0
