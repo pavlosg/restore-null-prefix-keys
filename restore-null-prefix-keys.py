@@ -11,6 +11,7 @@ import mc_bin_client
 import memcacheConstants
 
 # Update this to your cluster
+# Production KV port is 11210 or 11207 (SSL)
 kv_node = "localhost:12000"
 kv_node_ssl = False
 username = "Administrator"
@@ -28,6 +29,7 @@ def disconnect():
         client.close()
 
 def connect_client(host, port):
+    print('connect_client', host, port)
     client = mc_bin_client.MemcachedClient(host, port, use_ssl=kv_node_ssl)
     client.req_features = {memcacheConstants.FEATURE_SELECT_BUCKET,
                            memcacheConstants.FEATURE_JSON}
@@ -37,16 +39,19 @@ def connect_client(host, port):
     return client
 
 def connect_cluster():
-    node0 = kv_node.split(':')
-    client = connect_client(node0[0], int(node0[1]))
+    node0 = mc_bin_client.parse_address(kv_node)
+    client = connect_client(node0[0], node0[1])
     cluster_config = client.get_cluster_config()
     client.close()
+    # print(json.dumps(cluster_config, indent=2))
     for server in cluster_config['vBucketServerMap']['serverList']:
         host = server.split(':')
         port = int(host[1])
         host = host[0]
         if host == '$HOST':
             host = node0[0]
+        if kv_node_ssl:
+            port = 11207
         client = connect_client(host, port)
         kv_nodes.append(client)
     for vbid, servers in enumerate(cluster_config['vBucketServerMap']['vBucketMap']):
@@ -108,6 +113,7 @@ def main():
     doc_ids = get_doc_ids()
     print(f'Found {len(doc_ids)} null-prefixed doc ids\n')
     connect_cluster()
+    print()
     not_found_count = 0
     already_exist_count = 0
     added_count = 0

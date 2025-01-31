@@ -171,7 +171,7 @@ class MemcachedClient(object):
 
     vbucketId = 0
 
-    def __init__(self, host='127.0.0.1', port=11211, family=socket.AF_UNSPEC, use_ssl=False, verify=True, cacert=None):
+    def __init__(self, host='127.0.0.1', port=11211, family=socket.AF_UNSPEC, use_ssl=False):
         self.host = host
         self.port = port
 
@@ -188,11 +188,7 @@ class MemcachedClient(object):
                 sock.settimeout(10)
                 sock.connect(sockaddr)
                 if use_ssl:
-                    cert_req = ssl.CERT_REQUIRED
-                    if not verify:
-                        cert_req = ssl.CERT_NONE
-                    sock = ssl.wrap_socket(sock, server_side=False, do_handshake_on_connect=True, cert_reqs=cert_req,
-                                           ca_certs=cacert)
+                    sock = ssl._create_unverified_context().wrap_socket(sock, server_hostname=host)
                 self.s = sock
                 break
             except OSError as err:
@@ -204,8 +200,8 @@ class MemcachedClient(object):
             # Didn't break from the loop, re-raise the last error
             raise sock_error
 
-        self.s.setblocking(0)
-        self.r=random.Random()
+        # self.s.setblocking(0)
+        self.r = random.Random()
         self.req_features = set()
         self.features = set()
         self.error_map = None
@@ -247,10 +243,7 @@ class MemcachedClient(object):
         self.s.sendall(msg + extraHeader + to_bytes(key) + to_bytes(val))
 
     def _socketRecv(self, amount):
-        ready = select.select([self.s], [], [], 30)
-        if ready[0]:
-            return self.s.recv(amount)
-        raise TimeoutError(30)
+        return self.s.recv(amount)
 
     def _recvMsg(self):
         response = b''
