@@ -147,7 +147,7 @@ def main():
             not_found_count += 1
             continue
         for (doc, cas, flags, vbid) in docs:
-            print('Got', escaped_id, 'cas:', cas, 'vb:', vbid)
+            print('Got', escaped_id, 'cas:', cas, 'flags:', flags, 'vb:', vbid)
             if do_restore:
                 try:
                     add_doc(id[1:], doc, flags)
