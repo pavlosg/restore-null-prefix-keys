@@ -122,6 +122,8 @@ def main():
         print('Added test doc', json.dumps(id))
         disconnect()
         return
+    do_restore = 'restore' in sys.argv[1:]
+    do_delete = 'delete' in sys.argv[1:]
     not_found_count = 0
     already_exist_count = 0
     added_count = 0
@@ -130,19 +132,21 @@ def main():
         escaped_id = json.dumps(id)
         try:
             doc, cas, flags, vbid = get_doc(id)
-            print('Got', escaped_id)
-            try:
-                add_doc(id[1:], doc, flags)
-                print('Added', json.dumps(id[1:]))
-                added_count += 1
-            except mc_bin_client.ErrorKeyEexists:
-                print('Already exists', json.dumps(id[1:]))
-                already_exist_count += 1
-            delete_doc(id, cas, vbid)
-            print('Deleted', escaped_id)
-            deleted_count += 1
+            print('Got', escaped_id, 'cas:', cas, 'vb:', vbid)
+            if do_restore:
+                try:
+                    add_doc(id[1:], doc, flags)
+                    print('Added', json.dumps(id[1:]))
+                    added_count += 1
+                except mc_bin_client.ErrorKeyEexists:
+                    print('Already exists', json.dumps(id[1:]))
+                    already_exist_count += 1
+            if do_delete:
+                delete_doc(id, cas, vbid)
+                print('Deleted', escaped_id)
+                deleted_count += 1
         except mc_bin_client.ErrorKeyEnoent:
-            print("Not found", escaped_id)
+            print('Not found', escaped_id)
             not_found_count += 1
     print('\n------------------------------------------')
     print('Not found', not_found_count)
