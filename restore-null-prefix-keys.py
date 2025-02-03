@@ -11,13 +11,14 @@ from couchbase.options import (ClusterOptions, ClusterTimeoutOptions,
 import mc_bin_client
 import memcacheConstants
 
-# Update this to your cluster
-# Production KV port is 11210 or 11207 (SSL)
-kv_node = "localhost:12000"
-kv_node_ssl = False
+# Update this to your cluster:
+bucket_name = "default"
 username = "Administrator"
 password = "asdasd"
-bucket_name = "magma_bucket"
+kv_node_host = "localhost"
+# Production KV port is 11210 or 11207 (SSL)
+kv_node_port = 12000
+kv_node_ssl = False
 # User Input ends here.
 
 NUM_VBUCKETS = 1024
@@ -40,8 +41,7 @@ def connect_client(host, port):
     return client
 
 def connect_cluster():
-    node0 = mc_bin_client.parse_address(kv_node)
-    client = connect_client(node0[0], node0[1])
+    client = connect_client(kv_node_host, kv_node_port)
     cluster_config = client.get_cluster_config()
     client.close()
     # print(json.dumps(cluster_config, indent=2))
@@ -50,9 +50,9 @@ def connect_cluster():
         port = int(host[1])
         host = host[0]
         if host == '$HOST':
-            host = node0[0]
+            host = kv_node_host
         if kv_node_ssl:
-            port = 11207
+            port = kv_node_port
         client = connect_client(host, port)
         kv_nodes.append(client)
     for vbid, servers in enumerate(cluster_config['vBucketServerMap']['vBucketMap']):
@@ -64,19 +64,16 @@ def get_vbid(doc_id):
     return (((zlib.crc32(doc_id)) >> 16) & 0x7fff) % NUM_VBUCKETS
 
 def get_doc(id):
-    vbid = get_vbid(id)
-    client: mc_bin_client.MemcachedClient = vb_map[vbid]
-    try:
-        client.vbucketId = vbid
-        flags, cas, doc = client.get(id)
-        return doc, cas, flags, vbid
-    except mc_bin_client.ErrorKeyEnoent:
-        pass
-    vbid = get_vbid(id[1:])
-    client = vb_map[vbid]
-    client.vbucketId = vbid
-    flags, cas, doc = client.get(id)
-    return doc, cas, flags, vbid
+    docs = []
+    for vbid in [get_vbid(id[1:]), get_vbid(id)]:
+        client: mc_bin_client.MemcachedClient = vb_map[vbid]
+        try:
+            client.vbucketId = vbid
+            flags, cas, doc = client.get(id)
+            docs.append((doc, cas, flags, vbid))
+        except mc_bin_client.ErrorKeyEnoent:
+            pass
+    return docs
 
 def add_doc(id, value, flags, vbid=None):
     if vbid is None:
@@ -94,6 +91,7 @@ def delete_doc(id, cas, vbid=None):
 
 def get_doc_ids():
     doc_ids = []
+    kv_node = f'{kv_node_host}:{kv_node_port}'
     auth = PasswordAuthenticator(username, password)
     cluster = Cluster(('couchbases://' if kv_node_ssl else 'couchbase://') + kv_node, ClusterOptions(auth))
     cluster.wait_until_ready(timedelta(seconds=5))
@@ -112,26 +110,43 @@ def get_doc_ids():
     return doc_ids
 
 def main():
+    global bucket_name, username, password, kv_node_host, kv_node_port, kv_node_ssl
+    for arg in sys.argv[1:]:
+        if not arg.startswith('-C'):
+            continue
+        parts = arg[2:].split(':')
+        bucket_name = parts[0]
+        username = parts[1]
+        password = parts[2]
+        kv_node_host = parts[3]
+        kv_node_port = int(parts[4])
+        kv_node_ssl = len(parts) == 6 and parts[5] == 'ssl'
     doc_ids = get_doc_ids()
     print(f'Found {len(doc_ids)} null-prefixed doc ids\n')
     connect_cluster()
     print()
-    if len(sys.argv) == 3 and sys.argv[1] == 'test-add-doc':
-        id = '\0' + sys.argv[2]
-        add_doc(id, '{}', 0, get_vbid(sys.argv[2]))
+    for arg in sys.argv[1:]:
+        if not arg.startswith('-A'):
+            continue
+        id = '\0' + arg[2:]
+        add_doc(id, '{}', 0, get_vbid(id[1:]))
         print('Added test doc', json.dumps(id))
         disconnect()
         return
-    do_restore = 'restore' in sys.argv[1:]
-    do_delete = 'delete' in sys.argv[1:]
+    do_restore = '--restore' in sys.argv[1:]
+    do_delete = '--delete' in sys.argv[1:]
     not_found_count = 0
     already_exist_count = 0
     added_count = 0
     deleted_count = 0
     for id in doc_ids:
         escaped_id = json.dumps(id)
-        try:
-            doc, cas, flags, vbid = get_doc(id)
+        docs = get_doc(id)
+        if len(docs) == 0:
+            print('Not found', escaped_id)
+            not_found_count += 1
+            continue
+        for (doc, cas, flags, vbid) in docs:
             print('Got', escaped_id, 'cas:', cas, 'vb:', vbid)
             if do_restore:
                 try:
@@ -143,11 +158,8 @@ def main():
                     already_exist_count += 1
             if do_delete:
                 delete_doc(id, cas, vbid)
-                print('Deleted', escaped_id)
+                print('Deleted', escaped_id, 'vb:', vbid)
                 deleted_count += 1
-        except mc_bin_client.ErrorKeyEnoent:
-            print('Not found', escaped_id)
-            not_found_count += 1
     print('\n------------------------------------------')
     print('Not found', not_found_count)
     print('Already exist', already_exist_count)
