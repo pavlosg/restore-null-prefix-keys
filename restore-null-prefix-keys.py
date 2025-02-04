@@ -1,12 +1,13 @@
 import json
 import sys
-import zlib
+from argparse import ArgumentParser, ArgumentTypeError
 from datetime import timedelta
+from zlib import crc32
 
 from couchbase.auth import PasswordAuthenticator
 from couchbase.cluster import Cluster
 from couchbase.options import (ClusterOptions, ClusterTimeoutOptions,
-                               QueryOptions)
+                               TLSVerifyMode, QueryOptions)
 
 import mc_bin_client
 import memcacheConstants
@@ -14,10 +15,10 @@ import memcacheConstants
 # Update this to your cluster:
 bucket_name = "default"
 username = "Administrator"
-password = "asdasd"
+password = "password"
 kv_node_host = "localhost"
 # Production KV port is 11210 or 11207 (SSL)
-kv_node_port = 12000
+kv_node_port = 11210
 kv_node_ssl = False
 # User Input ends here.
 
@@ -61,7 +62,7 @@ def connect_cluster():
 def get_vbid(doc_id):
     if isinstance(doc_id, str):
         doc_id = doc_id.encode()
-    return (((zlib.crc32(doc_id)) >> 16) & 0x7fff) % NUM_VBUCKETS
+    return ((crc32(doc_id) >> 16) & 0x7fff) % NUM_VBUCKETS
 
 def get_doc(id):
     docs = []
@@ -92,11 +93,11 @@ def delete_doc(id, cas, vbid=None):
 def get_doc_ids():
     doc_ids = []
     kv_node = f'{kv_node_host}:{kv_node_port}'
-    auth = PasswordAuthenticator(username, password)
-    cluster = Cluster(('couchbases://' if kv_node_ssl else 'couchbase://') + kv_node, ClusterOptions(auth))
+    options = ClusterOptions(PasswordAuthenticator(username, password), tls_verify=TLSVerifyMode.NONE)
+    options.apply_profile('wan_development')
+    cluster = Cluster(('couchbases://' if kv_node_ssl else 'couchbase://') + kv_node, options)
     cluster.wait_until_ready(timedelta(seconds=5))
-    query_result = cluster.query(
-        'select meta().id from `' + bucket_name + '` where meta().id like "\\u0000%"')
+    query_result = cluster.query(f'select meta().id from `{bucket_name}` where meta().id like "\\u0000%"')
     for row in query_result:
         id = row['id']
         if len(id) < 2:
@@ -109,32 +110,47 @@ def get_doc_ids():
     cluster.close()
     return doc_ids
 
+def check_port(s):
+    v = int(s)
+    if v <= 0 or v >= 0x10000:
+        raise ArgumentTypeError(f'{v} is not a valid port number')
+    return v
+
+def parse_args():
+    parser = ArgumentParser(allow_abbrev=False)
+    parser.add_argument('-b', '--bucket', default=bucket_name)
+    parser.add_argument('-u', '--username', default=username)
+    parser.add_argument('-p', '--password', default=password)
+    parser.add_argument('--port', default=kv_node_port, type=check_port, help='KV node port (11210 or 11207 for TLS)')
+    parser.add_argument('--host', default=kv_node_host, help='KV node hostname')
+    parser.add_argument('--tls', default=False, action='store_true')
+    parser.add_argument('--delete', action='store_true', help='Delete docs with null key prefix')
+    parser.add_argument('--restore', action='store_true', help='Add docs removing the null key prefix')
+    parser.add_argument('--add-test-doc', metavar='DOC_ID', dest='add_test_doc', help='Add a test doc with null key prefix')
+    return parser.parse_args()
+
 def main():
     global bucket_name, username, password, kv_node_host, kv_node_port, kv_node_ssl
-    for arg in sys.argv[1:]:
-        if not arg.startswith('-C'):
-            continue
-        parts = arg[2:].split(':')
-        bucket_name = parts[0]
-        username = parts[1]
-        password = parts[2]
-        kv_node_host = parts[3]
-        kv_node_port = int(parts[4])
-        kv_node_ssl = len(parts) == 6 and parts[5] == 'ssl'
+    options = parse_args()
+    bucket_name = options.bucket
+    username = options.username
+    password = options.password
+    kv_node_host = options.host
+    kv_node_port = options.port
+    kv_node_ssl = options.tls
     doc_ids = get_doc_ids()
-    print(f'Found {len(doc_ids)} null-prefixed doc ids\n')
+    print(f'Indexed {len(doc_ids)} null-prefixed doc ids\n')
     connect_cluster()
     print()
-    for arg in sys.argv[1:]:
-        if not arg.startswith('-A'):
-            continue
-        id = '\0' + arg[2:]
-        add_doc(id, '{}', 0, get_vbid(id[1:]))
-        print('Added test doc', json.dumps(id))
+    if options.add_test_doc is not None:
+        id = '\0' + options.add_test_doc
+        try:
+            add_doc(id, '{}', 0, get_vbid(id[1:]))
+            print('Added test doc', json.dumps(id))
+        except mc_bin_client.ErrorKeyEexists:
+            print('Already exists', json.dumps(id))
         disconnect()
         return
-    do_restore = '--restore' in sys.argv[1:]
-    do_delete = '--delete' in sys.argv[1:]
     not_found_count = 0
     already_exist_count = 0
     added_count = 0
@@ -148,7 +164,7 @@ def main():
             continue
         for (doc, cas, flags, vbid) in docs:
             print('Got', escaped_id, 'cas:', cas, 'flags:', flags, 'vb:', vbid)
-            if do_restore:
+            if options.restore:
                 try:
                     add_doc(id[1:], doc, flags)
                     print('Added', json.dumps(id[1:]))
@@ -156,7 +172,7 @@ def main():
                 except mc_bin_client.ErrorKeyEexists:
                     print('Already exists', json.dumps(id[1:]))
                     already_exist_count += 1
-            if do_delete:
+            if options.delete:
                 delete_doc(id, cas, vbid)
                 print('Deleted', escaped_id, 'vb:', vbid)
                 deleted_count += 1
