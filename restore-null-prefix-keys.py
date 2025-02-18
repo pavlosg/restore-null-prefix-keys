@@ -1,28 +1,23 @@
+import array
 import json
-import sys
 from argparse import ArgumentParser, ArgumentTypeError
 from datetime import timedelta
 from zlib import crc32
 
 from couchbase.auth import PasswordAuthenticator
 from couchbase.cluster import Cluster
-from couchbase.options import (ClusterOptions, ClusterTimeoutOptions,
-                               TLSVerifyMode, QueryOptions)
+from couchbase.options import ClusterOptions, TLSVerifyMode
 
 import mc_bin_client
 import memcacheConstants
 
-# Update this to your cluster:
 bucket_name = "default"
 username = "Administrator"
 password = "password"
 kv_node_host = "localhost"
-# Production KV port is 11210 or 11207 (SSL)
 kv_node_port = 11210
 kv_node_ssl = False
-# User Input ends here.
-
-NUM_VBUCKETS = 1024
+collection_id = 0
 
 kv_nodes = []
 vb_map = {}
@@ -35,8 +30,9 @@ def connect_client(host, port):
     print('connect_client', host, port)
     client = mc_bin_client.MemcachedClient(host, port, use_ssl=kv_node_ssl)
     client.req_features = {memcacheConstants.FEATURE_SELECT_BUCKET,
-                           memcacheConstants.FEATURE_JSON}
-    client.hello('restore-null-prefix-keys')
+                           memcacheConstants.FEATURE_JSON,
+                           memcacheConstants.FEATURE_COLLECTIONS}
+    client.hello('manage-cid-prefix-keys')
     client.sasl_auth_plain(username, password)
     client.bucket_select(bucket_name)
     return client
@@ -58,55 +54,63 @@ def connect_cluster():
         kv_nodes.append(client)
     for vbid, servers in enumerate(cluster_config['vBucketServerMap']['vBucketMap']):
         vb_map[vbid] = kv_nodes[servers[0]]
+    assert len(vb_map) in [1024, 128, 64]
 
 def get_vbid(doc_id):
     if isinstance(doc_id, str):
         doc_id = doc_id.encode()
-    return ((crc32(doc_id) >> 16) & 0x7fff) % NUM_VBUCKETS
+    return ((crc32(doc_id) >> 16) & 0x7fff) % len(vb_map)
 
-def get_doc(id):
+def encode_key(doc_id, cid=0):
+    prefix = array.array('B', [])
+    while True:
+        byte = cid & 0x7f
+        cid >>= 7
+        if cid > 0:
+            prefix.append(byte | 0x80)
+        else:
+            prefix.append(byte)
+            break
+    if isinstance(doc_id, str):
+        doc_id = doc_id.encode()
+    return prefix.tobytes() + doc_id
+
+def get_doc(id: str):
     docs = []
-    for vbid in [get_vbid(id[1:]), get_vbid(id)]:
+    prefix = encode_key('', collection_id).decode(errors='ignore')
+    for vbid in [get_vbid(id), get_vbid(id.removeprefix(prefix))]:
         client: mc_bin_client.MemcachedClient = vb_map[vbid]
         try:
             client.vbucketId = vbid
-            flags, cas, doc = client.get(id)
+            flags, cas, doc = client.get(encode_key(id))
             docs.append((doc, cas, flags, vbid))
         except mc_bin_client.ErrorKeyEnoent:
             pass
     return docs
 
-def add_doc(id, value, flags, vbid=None):
+def add_doc(id, cid, value, flags, vbid=None):
     if vbid is None:
         vbid = get_vbid(id)
     client: mc_bin_client.MemcachedClient = vb_map[vbid]
     client.vbucketId = vbid
-    client.add_with_dtype(id, 0, flags, value, 1)
+    client.add_with_dtype(encode_key(id, cid), 0, flags, value, 1)
 
 def delete_doc(id, cas, vbid=None):
     if vbid is None:
         vbid = get_vbid(id)
     client: mc_bin_client.MemcachedClient = vb_map[vbid]
     client.vbucketId = vbid
-    client.delete(id, cas)
+    client.delete(encode_key(id), cas)
 
 def get_doc_ids():
-    doc_ids = []
     kv_node = f'{kv_node_host}:{kv_node_port}'
     options = ClusterOptions(PasswordAuthenticator(username, password), tls_verify=TLSVerifyMode.NONE)
     options.apply_profile('wan_development')
     cluster = Cluster(('couchbases://' if kv_node_ssl else 'couchbase://') + kv_node, options)
     cluster.wait_until_ready(timedelta(seconds=5))
-    query_result = cluster.query(f'select meta().id from `{bucket_name}` where meta().id like "\\u0000%"')
-    for row in query_result:
-        id = row['id']
-        if len(id) < 2:
-            print('Expecting doc id to have length at least 2 bytes')
-            continue
-        if id[0] != '\0':
-            print("Prefix not null!!!", json.dumps(id))
-            continue
-        doc_ids.append(id)
+    prefix = json.dumps(encode_key('%', collection_id).decode(errors='ignore'))
+    query_result = cluster.query(f'select meta().id from `{bucket_name}` where meta().id like {prefix}')
+    doc_ids = [row['id'] for row in query_result]
     cluster.close()
     return doc_ids
 
@@ -123,14 +127,15 @@ def parse_args():
     parser.add_argument('-p', '--password', default=password)
     parser.add_argument('--port', default=kv_node_port, type=check_port, help='KV node port (11210 or 11207 for TLS)')
     parser.add_argument('--host', default=kv_node_host, help='KV node hostname')
-    parser.add_argument('--tls', default=False, action='store_true')
-    parser.add_argument('--delete', action='store_true', help='Delete docs with null key prefix')
-    parser.add_argument('--restore', action='store_true', help='Add docs removing the null key prefix')
-    parser.add_argument('--add-test-doc', metavar='DOC_ID', dest='add_test_doc', help='Add a test doc with null key prefix')
+    parser.add_argument('--tls', default=kv_node_ssl, action='store_true')
+    parser.add_argument('--cid', default=collection_id, type=int)
+    parser.add_argument('--delete', action='store_true', help='Delete docs with cid key prefix')
+    parser.add_argument('--restore', action='store_true', help='Add docs removing the cid key prefix')
+    parser.add_argument('--add-test-doc', metavar='DOC_ID', dest='add_test_doc', help='Add a test doc with cid key prefix')
     return parser.parse_args()
 
 def main():
-    global bucket_name, username, password, kv_node_host, kv_node_port, kv_node_ssl
+    global bucket_name, username, password, kv_node_host, kv_node_port, kv_node_ssl, collection_id
     options = parse_args()
     bucket_name = options.bucket
     username = options.username
@@ -138,17 +143,21 @@ def main():
     kv_node_host = options.host
     kv_node_port = options.port
     kv_node_ssl = options.tls
+    collection_id = options.cid
+    assert collection_id >= 0 and collection_id < 32
     doc_ids = get_doc_ids()
-    print(f'Indexed {len(doc_ids)} null-prefixed doc ids\n')
+    print(f'Indexed {len(doc_ids)} cid-prefixed doc ids\n')
     connect_cluster()
     print()
     if options.add_test_doc is not None:
-        id = '\0' + options.add_test_doc
+        id = options.add_test_doc
+        key = encode_key(id, collection_id)
+        escaped_key = json.dumps(key.decode(errors='ignore'))
         try:
-            add_doc(id, '{}', 0, get_vbid(id[1:]))
-            print('Added test doc', json.dumps(id))
+            add_doc(key, 0, '{}', 0, vbid=get_vbid(id))
+            print('Added test doc', escaped_key, 'cid:', 0)
         except mc_bin_client.ErrorKeyEexists:
-            print('Already exists', json.dumps(id))
+            print('Already exists', escaped_key, 'cid:', 0)
         disconnect()
         return
     not_found_count = 0
@@ -162,15 +171,17 @@ def main():
             print('Not found', escaped_id)
             not_found_count += 1
             continue
+        prefix = encode_key('', collection_id).decode(errors='ignore')
         for (doc, cas, flags, vbid) in docs:
             print('Got', escaped_id, 'cas:', cas, 'flags:', flags, 'vb:', vbid)
             if options.restore:
                 try:
-                    add_doc(id[1:], doc, flags)
-                    print('Added', json.dumps(id[1:]))
+                    new_id = id.removeprefix(prefix)
+                    add_doc(new_id, collection_id, doc, flags)
+                    print('Added', json.dumps(new_id), 'cid:', collection_id)
                     added_count += 1
                 except mc_bin_client.ErrorKeyEexists:
-                    print('Already exists', json.dumps(id[1:]))
+                    print('Already exists', json.dumps(new_id), 'cid:', collection_id)
                     already_exist_count += 1
             if options.delete:
                 delete_doc(id, cas, vbid)
