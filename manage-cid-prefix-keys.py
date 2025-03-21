@@ -18,6 +18,7 @@ kv_node_host = "localhost"
 kv_node_port = 11210
 kv_node_ssl = False
 collection_id = 0
+search_all_vbs = False
 
 kv_nodes = []
 vb_map = {}
@@ -78,7 +79,8 @@ def encode_key(doc_id, cid=0):
 def get_doc(id: str):
     docs = []
     prefix = encode_key('', collection_id).decode(errors='ignore')
-    for vbid in [get_vbid(id), get_vbid(id.removeprefix(prefix))]:
+    vbs = range(len(vb_map)) if search_all_vbs else [get_vbid(id), get_vbid(id.removeprefix(prefix))]
+    for vbid in vbs:
         client: mc_bin_client.MemcachedClient = vb_map[vbid]
         try:
             client.vbucketId = vbid
@@ -129,13 +131,14 @@ def parse_args():
     parser.add_argument('--host', default=kv_node_host, help='KV node hostname')
     parser.add_argument('--tls', default=kv_node_ssl, action='store_true')
     parser.add_argument('--cid', default=collection_id, type=int)
+    parser.add_argument('--search-all-vbs', dest='search_all_vbs', action='store_true', help='Search all vbuckets')
     parser.add_argument('--delete', action='store_true', help='Delete docs with cid key prefix')
     parser.add_argument('--restore', action='store_true', help='Add docs removing the cid key prefix')
     parser.add_argument('--add-test-doc', metavar='DOC_ID', dest='add_test_doc', help='Add a test doc with cid key prefix')
     return parser.parse_args()
 
 def main():
-    global bucket_name, username, password, kv_node_host, kv_node_port, kv_node_ssl, collection_id
+    global bucket_name, username, password, kv_node_host, kv_node_port, kv_node_ssl, collection_id, search_all_vbs
     options = parse_args()
     bucket_name = options.bucket
     username = options.username
@@ -144,6 +147,7 @@ def main():
     kv_node_port = options.port
     kv_node_ssl = options.tls
     collection_id = options.cid
+    search_all_vbs = options.search_all_vbs
     assert collection_id >= 0 and collection_id < 32
     doc_ids = get_doc_ids()
     print(f'Indexed {len(doc_ids)} cid-prefixed doc ids\n')
@@ -154,10 +158,17 @@ def main():
         key = encode_key(id, collection_id)
         escaped_key = json.dumps(key.decode(errors='ignore'))
         try:
-            add_doc(key, 0, '{}', 0, vbid=get_vbid(id))
-            print('Added test doc', escaped_key, 'cid:', 0)
+            vbid = get_vbid(id)
+            add_doc(key, 0, '{}', 0, vbid)
+            print('Added test doc', escaped_key, 'vb:', vbid)
+            vbid = get_vbid(key)
+            add_doc(key, 0, '{}', 0, vbid)
+            print('Added test doc', escaped_key, 'vb:', vbid)
+            vbid = get_vbid(b'\0' + key)
+            add_doc(key, 0, '{}', 0, vbid)
+            print('Added test doc', escaped_key, 'vb:', vbid)
         except mc_bin_client.ErrorKeyEexists:
-            print('Already exists', escaped_key, 'cid:', 0)
+            print('Already exists', escaped_key)
         disconnect()
         return
     not_found_count = 0
@@ -171,15 +182,18 @@ def main():
             print('Not found', escaped_id)
             not_found_count += 1
             continue
+        docs.sort(reverse=True, key=lambda x: x[1]) # sort by cas
         prefix = encode_key('', collection_id).decode(errors='ignore')
+        restored_one = False
         for (doc, cas, flags, vbid) in docs:
             print('Got', escaped_id, 'cas:', cas, 'flags:', flags, 'vb:', vbid)
-            if options.restore:
+            if options.restore and not restored_one:
                 try:
                     new_id = id.removeprefix(prefix)
                     add_doc(new_id, collection_id, doc, flags)
                     print('Added', json.dumps(new_id), 'cid:', collection_id)
                     added_count += 1
+                    restored_one = True
                 except mc_bin_client.ErrorKeyEexists:
                     print('Already exists', json.dumps(new_id), 'cid:', collection_id)
                     already_exist_count += 1
