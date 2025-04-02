@@ -497,6 +497,13 @@ class MemcachedClient(object):
         parts=self._doCmd(memcacheConstants.CMD_GET_REPLICA, key, '', collection=collection)
         return self.__parseGet(parts, len(key))
 
+    def subdoc_get(self, key, path, flags, collection=None):
+        path = to_bytes(path)
+        extras = struct.pack('>HB', len(path), flags)
+        parts = self._doCmd(memcacheConstants.CMD_SUBDOC_GET, key, path,
+                            extras, collection=collection)
+        return json.loads(parts[-1])
+
     def version(self):
         """Get the value for a given key within the memcached server."""
         return self._doCmd(memcacheConstants.CMD_VERSION, '', '')

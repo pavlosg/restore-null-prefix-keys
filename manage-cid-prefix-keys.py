@@ -32,6 +32,7 @@ def connect_client(host, port):
     client = mc_bin_client.MemcachedClient(host, port, use_ssl=kv_node_ssl)
     client.req_features = {memcacheConstants.FEATURE_SELECT_BUCKET,
                            memcacheConstants.FEATURE_JSON,
+                           memcacheConstants.FEATURE_XATTR,
                            memcacheConstants.FEATURE_COLLECTIONS}
     client.hello('manage-cid-prefix-keys')
     client.sasl_auth_plain(username, password)
@@ -104,6 +105,16 @@ def delete_doc(id, cas, vbid=None):
     client.vbucketId = vbid
     client.delete(encode_key(id), cas)
 
+def get_xattrs(id, vbid):
+    client: mc_bin_client.MemcachedClient = vb_map[vbid]
+    client.vbucketId = vbid
+    key = encode_key(id)
+    xkeys = client.subdoc_get(key, '$XTOC', 4)
+    xattrs = {}
+    for xkey in xkeys:
+        xattrs[xkey] = client.subdoc_get(key, xkey, 4)
+    return xattrs
+
 def get_doc_ids():
     kv_node = f'{kv_node_host}:{kv_node_port}'
     options = ClusterOptions(PasswordAuthenticator(username, password), tls_verify=TLSVerifyMode.NONE)
@@ -132,6 +143,7 @@ def parse_args():
     parser.add_argument('--tls', default=kv_node_ssl, action='store_true')
     parser.add_argument('--cid', default=collection_id, type=int)
     parser.add_argument('--search-all-vbs', dest='search_all_vbs', action='store_true', help='Search all vbuckets')
+    parser.add_argument('--print-xattrs', dest='print_xattrs', action='store_true')
     parser.add_argument('--delete', action='store_true', help='Delete docs with cid key prefix')
     parser.add_argument('--restore', action='store_true', help='Add docs removing the cid key prefix')
     parser.add_argument('--add-test-doc', metavar='DOC_ID', dest='add_test_doc', help='Add a test doc with cid key prefix')
@@ -187,6 +199,8 @@ def main():
         restored_one = False
         for (doc, cas, flags, vbid) in docs:
             print('Got', escaped_id, 'cas:', cas, 'flags:', flags, 'vb:', vbid)
+            if options.print_xattrs:
+                print('XATTRS:', json.dumps(get_xattrs(id, vbid), indent=2))
             if options.restore and not restored_one:
                 try:
                     new_id = id.removeprefix(prefix)
